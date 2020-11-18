@@ -4,6 +4,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <esp_timer.h>
+#include "RotaryEncoder.hpp"
 
 #define A_PIN 32
 #define B_PIN 33
@@ -16,34 +17,32 @@
 #define OLED_RESET -1 // Reset pin # (or -1 if sharing Arduino reset pin)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-const int debounceTime_us = 250;
+class EncoderListener : public RotaryEncoderListener
+{
+  virtual void turned(RotaryEncoder *source, int deltaClicks, int rpm);
+  virtual void clicked(RotaryEncoder *source);
+};
 
-volatile bool aPinPending;
-volatile bool zPinPending;
-volatile int aPinDelta;
-volatile int aPinTotalTriggers;
-volatile bool bPinValue;
-volatile bool zPinTriggered;
-
-esp_timer_handle_t aPinTimer;
-esp_timer_handle_t zPinTimer;
-
-void IRAM_ATTR APinHandler();
-void IRAM_ATTR ZPinHandler();
-void APinDebounce(void *);
-void ZPinDebounce(void *);
+EncoderListener listener;
+RotaryEncoder encoder(&listener, A_PIN, B_PIN, Z_PIN, 24);
+int aPinDelta;
+int encoder_rpm;
+bool zPinTriggered;
 
 volatile bool leftDisplayClearTriggered;
 volatile bool centerDisplayClearTriggered;
 volatile bool rightDisplayClearTriggered;
+volatile bool rpmClearTriggered;
 
 esp_timer_handle_t leftDisplayTimer;
 esp_timer_handle_t centerDisplayTimer;
 esp_timer_handle_t rightDisplayTimer;
+esp_timer_handle_t rpmTimer;
 
 void leftDisplayClear(void *);
 void centerDisplayClear(void *);
 void rightDisplayClear(void *);
+void rpmClear(void *);
 
 const int displayClearTime_us = 100000;
 const int displaySide = 4;
@@ -54,16 +53,13 @@ const int centerDisplayY = 18;
 const int rightDisplayX = SCREEN_WIDTH - 6;
 const int rightDisplayY = 18;
 
-esp_timer_create_args_t aPinTimerArgs;
-esp_timer_create_args_t zPinTimerArgs;
 esp_timer_create_args_t leftDisplayTimerArgs;
 esp_timer_create_args_t centerDisplayTimerArgs;
 esp_timer_create_args_t rightDisplayTimerArgs;
+esp_timer_create_args_t rpmTimerArgs;
 
 int indicatorX;
 void updateIndicator(int dir);
-
-unsigned long lastRotaryTick_ms;
 
 void setup()
 {
@@ -77,6 +73,8 @@ void setup()
     for (;;)
       ; // Don't proceed, loop forever
   }
+
+  encoder.init();
 
   indicatorX = (SCREEN_WIDTH / 2) - 2;
   display.clearDisplay();
@@ -94,30 +92,10 @@ void setup()
   display.drawRect(indicatorX, 24, 4, 8, SSD1306_WHITE);
   display.display();
 
-  lastRotaryTick_ms = 0;
-
-  aPinPending = false;
-  zPinPending = false;
-  aPinDelta = 0;
-  aPinTotalTriggers = 0;
-  bPinValue = false;
-  zPinTriggered = false;
   leftDisplayClearTriggered = false;
   centerDisplayClearTriggered = false;
   rightDisplayClearTriggered = false;
-
-  pinMode(A_PIN, INPUT_PULLUP);
-  pinMode(B_PIN, INPUT_PULLUP);
-  pinMode(Z_PIN, INPUT_PULLUP);
-
-  attachInterrupt(A_PIN, APinHandler, FALLING);
-  attachInterrupt(Z_PIN, ZPinHandler, FALLING);
-
-  aPinTimerArgs.callback = &APinDebounce;
-  esp_timer_create(&aPinTimerArgs, &aPinTimer);
-
-  zPinTimerArgs.callback = &ZPinDebounce;
-  esp_timer_create(&zPinTimerArgs, &zPinTimer);
+  rpmClearTriggered = false;
 
   leftDisplayTimerArgs.callback = &leftDisplayClear;
   esp_timer_create(&leftDisplayTimerArgs, &leftDisplayTimer);
@@ -127,37 +105,35 @@ void setup()
 
   rightDisplayTimerArgs.callback = &rightDisplayClear;
   esp_timer_create(&rightDisplayTimerArgs, &rightDisplayTimer);
+
+  rpmTimerArgs.callback = &rpmClear;
+  esp_timer_create(&rpmTimerArgs, &rpmTimer);
 }
 
 void loop()
 {
-  bool displayStuffHappened = false;
-  unsigned long now = millis();
+  encoder.loop();
 
-  if ((now > lastRotaryTick_ms) && (now - lastRotaryTick_ms) > 50)
+  bool displayStuffHappened = false;
+
+  if (encoder_rpm != 0)
   {
+    int temp_rpm = encoder_rpm;
+    encoder_rpm = 0;
     display.fillRect(0, 16, SCREEN_WIDTH / 2, 8, SSD1306_BLACK);
     display.setCursor(0, 16);
-    display.printf("RPM: %4d", 0);
+    display.printf("RPM: %4d", temp_rpm);
+    esp_timer_start_once(rpmTimer, displayClearTime_us);
     displayStuffHappened = true;
+    Serial.printf("RPM: %3d\r\n", temp_rpm);
   }
 
-  if (aPinTotalTriggers != 0)
+  if (aPinDelta != 0)
   {
-    int tempTotalTriggers = aPinTotalTriggers;
     int tempDelta = aPinDelta;
-    aPinTotalTriggers = 0;
     aPinDelta = 0;
-    int tickTime_ms = now > lastRotaryTick_ms ? (now - lastRotaryTick_ms) / tempTotalTriggers : 50;
-    lastRotaryTick_ms = now;
 
-    int rpm = int(60000.0 / (double(tickTime_ms) * 24.0));
-    display.fillRect(0, 16, SCREEN_WIDTH / 2, 8, SSD1306_BLACK);
-    display.setCursor(0, 16);
-    display.printf("RPM: %4d", rpm);
-    displayStuffHappened = true;
-
-    Serial.printf("A triggered! Count: %3d Delta: %3d Tick time: %4d\r\n", tempTotalTriggers, tempDelta, tickTime_ms);
+    Serial.printf("A triggered! Delta: %3d\r\n", tempDelta);
 
     if (tempDelta > 0)
     {
@@ -210,55 +186,30 @@ void loop()
     displayStuffHappened = true;
   }
 
+  if (rpmClearTriggered)
+  {
+    rpmClearTriggered = false;
+    display.fillRect(0, 16, SCREEN_WIDTH / 2, 8, SSD1306_BLACK);
+    display.setCursor(0, 16);
+    display.printf("RPM: %4d", 0);
+    displayStuffHappened = true;
+  }
+
   if (displayStuffHappened)
   {
     display.display();
   }
 }
 
-void IRAM_ATTR APinHandler()
+void EncoderListener::turned(RotaryEncoder *source, int deltaClicks, int rpm)
 {
-  if (!aPinPending)
-  {
-    aPinPending = true;
-    bPinValue = digitalRead(B_PIN) == LOW;
-    esp_timer_start_once(aPinTimer, debounceTime_us);
-  }
+  aPinDelta = deltaClicks;
+  encoder_rpm = rpm;
 }
 
-void IRAM_ATTR ZPinHandler()
+void EncoderListener::clicked(RotaryEncoder *source)
 {
-  if (!zPinPending)
-  {
-    zPinPending = true;
-    esp_timer_start_once(zPinTimer, debounceTime_us);
-  }
-}
-
-void APinDebounce(void *)
-{
-  aPinPending = false;
-  if (digitalRead(A_PIN) == LOW)
-  {
-    aPinTotalTriggers++;
-    if (bPinValue)
-    {
-      aPinDelta++;
-    }
-    else
-    {
-      aPinDelta--;
-    }
-  }
-}
-
-void ZPinDebounce(void *)
-{
-  zPinPending = false;
-  if (digitalRead(Z_PIN) == LOW)
-  {
-    zPinTriggered = true;
-  }
+  zPinTriggered = true;
 }
 
 void leftDisplayClear(void *)
@@ -274,6 +225,11 @@ void centerDisplayClear(void *)
 void rightDisplayClear(void *)
 {
   rightDisplayClearTriggered = true;
+}
+
+void rpmClear(void *)
+{
+  rpmClearTriggered = true;
 }
 
 void updateIndicator(int dir)
